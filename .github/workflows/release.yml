@@ -106,8 +106,6 @@ jobs:
         run: |
           mkdir -p build
           cp -r firefox build/firefox
-          # Community build: neutral icons instead of the Tailscale logo.
-          cp packaging/icons/*.png build/firefox/
           # The extension code is BSD-3-Clause; ship the license inside the package.
           cp LICENSE PATENTS build/firefox/
           jq --arg v "$VERSION" --arg id "$ADDON_ID" --arg n "$ADDON_NAME" '
