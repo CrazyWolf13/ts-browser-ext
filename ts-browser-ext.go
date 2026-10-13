@@ -205,7 +205,8 @@ func install(installArg string) error {
 		"path": "%s",
 		"type": "stdio",
 		"allowed_extensions": [
-			"browser-ext@tailscale.com"
+			"browser-ext@tailscale.com",
+			"ts-browser-ext@crazywolf.dev"
 		]
 	  }`, targetBinJSONPath)
 	default:

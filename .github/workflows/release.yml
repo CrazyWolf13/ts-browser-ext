@@ -1,0 +1,156 @@
+# Manual release: Actions -> release -> "Run workflow", pick the branch and a version.
+# Builds the native helper for all platforms, gets the Firefox extension signed by
+# Mozilla (AMO "unlisted" channel; it is NOT published on addons.mozilla.org), then
+# creates the tag v<version> on the selected commit and attaches everything to a release.
+#
+# One-time setup, see packaging/README.md (AMO API keys as repository secrets
+# AMO_JWT_ISSUER and AMO_JWT_SECRET).
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without leading v, e.g. 0.1.0 (must be higher than the previous one)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as pre-release (the install script only sees non-pre-releases)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  VERSION: ${{ inputs.version }}
+  # Must be unique and must NOT impersonate the official Tailscale extension.
+  # install() in ts-browser-ext.go must allow this ID.
+  ADDON_ID: ts-browser-ext@crazywolf.dev
+  ADDON_NAME: ts-browser-ext (community build)
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate version and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must look like 1.2.3"; exit 1; }
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "tag v$VERSION already exists"; exit 1
+          fi
+
+  helper:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64, ext: ".exe" }
+          - { goos: windows, goarch: arm64, ext: ".exe" }
+          - { goos: linux, goarch: amd64, ext: "" }
+          - { goos: linux, goarch: arm64, ext: "" }
+          - { goos: darwin, goarch: arm64, ext: "" }
+          - { goos: darwin, goarch: amd64, ext: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build helper
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          # Stamp the version, otherwise tailscale reports "<ver>-ERR-BuildInfo".
+          TSV=$(go list -m -f '{{.Version}}' tailscale.com | sed 's/^v//')
+          LDFLAGS="-X tailscale.com/version.shortStamp=${TSV} -X tailscale.com/version.longStamp=${TSV}-g${GITHUB_SHA::9}"
+          go build -trimpath -ldflags "$LDFLAGS" \
+            -o "dist/ts-browser-ext_${GOOS}_${GOARCH}${{ matrix.ext }}" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helper-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
+  licenses:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Collect license notices
+        run: |
+          mkdir -p dist
+          packaging/collect-licenses.sh dist/THIRD_PARTY_NOTICES.txt
+          cp LICENSE PATENTS dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: licenses
+          path: dist/*
+
+  extension:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Prepare Firefox extension
+        run: |
+          mkdir -p build
+          cp -r firefox build/firefox
+          # Community build: neutral icons instead of the Tailscale logo.
+          cp packaging/icons/*.png build/firefox/
+          # The extension code is BSD-3-Clause; ship the license inside the package.
+          cp LICENSE PATENTS build/firefox/
+          jq --arg v "$VERSION" --arg id "$ADDON_ID" --arg n "$ADDON_NAME" '
+            .version = $v
+            | .name = $n
+            | .browser_specific_settings.gecko.id = $id
+            | .browser_specific_settings.gecko.data_collection_permissions = {"required": ["none"]}
+          ' firefox/manifest.json > build/firefox/manifest.json
+          cat build/firefox/manifest.json
+      - name: Lint
+        run: npx --yes web-ext@8 lint --source-dir build/firefox
+      - name: Sign (AMO unlisted)
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          npx --yes web-ext@8 sign --channel=unlisted \
+            --source-dir build/firefox --artifacts-dir build/signed
+          mkdir -p dist
+          mv build/signed/*.xpi dist/ts-browser-ext-firefox.xpi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension
+          path: dist/*
+
+  release:
+    needs: [helper, licenses, extension]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Checksums
+        run: cd assets && sha256sum * > SHA256SUMS.txt
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          flags=()
+          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          # --target makes gh create the tag v$VERSION on exactly the commit that was built.
+          gh release create "v$VERSION" assets/* \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "v$VERSION" --generate-notes "${flags[@]}"
